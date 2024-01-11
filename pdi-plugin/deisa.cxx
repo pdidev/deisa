@@ -131,7 +131,7 @@ public:
             } else if (key == "logging" || key == "init_on") {
                 //
             } else {
-                throw Config_error{key_tree, "Unknown key in Deisa file configuration: `{}'", key};
+                throw Config_error{key_tree, "Unknown key in Deisa file configuration: '{}'", key};
             }
         });
 
