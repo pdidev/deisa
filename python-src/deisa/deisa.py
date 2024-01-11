@@ -9,26 +9,18 @@
 #
 ###################################################################################################
 
-import sys
-import os
-
-import dask
-import dask.array as da
-from dask.array import Array
-from dask.delayed import Delayed
-from dask.distributed import Client, Event, get_client, comm, Queue, Future, Variable
-import numpy as np
 import itertools
-import asyncio
-
-from contextlib import redirect_stdout
 import json
-import yaml
-
+import os
 import time
 import trace
 
-from . __version__ import __version__
+import dask
+import dask.array as da
+import numpy as np
+import yaml
+from dask.array import Array
+from dask.distributed import Client, Queue, Future, Variable
 
 
 def Deisa(scheduler_info, config):
@@ -107,16 +99,16 @@ class deisa_array:
                         [slc[s].start, slc[s].stop, slc[s].step], s))
                 elif isinstance(slc[s], int):
                     if slc[s] >= 0:
-                        selection.append((slc[s], slc[s]+1, 1))
+                        selection.append((slc[s], slc[s] + 1, 1))
                     else:
-                        selec0 = slc[s]+self.array.shape[s]
-                        selec1 = slc[s]+self.array.shape[slc.index(s)]+1
+                        selec0 = slc[s] + self.array.shape[s]
+                        selec1 = slc[s] + self.array.shape[slc.index(s)] + 1
                         selection.append((selec0, selec1, 1))
                 elif isinstance(slc[s], type(Ellipsis)):
                     selection.append(self.normalize_slice([0, None, 1], s))
         elif isinstance(slc, int):
             if slc >= 0:
-                selection.append((slc, slc+1, 1))
+                selection.append((slc, slc + 1, 1))
             else:
                 selection.append(
                     (slc + self.array.shape[0], slc + self.array.shape[0] + 1, 1))
@@ -220,13 +212,13 @@ class Bridge:
         if Ssize > len(listw):  # more processes than workers
             self.workers = [listw[rank % len(listw)]]
         else:
-            k = len(listw)//Ssize  # more workers than processes
-            self.workers = listw[rank*k:rank*k + k]
+            k = len(listw) // Ssize  # more workers than processes
+            self.workers = listw[rank * k:rank * k + k]
         self.arrays = arrays
         for ele in self.arrays:
             self.arrays[ele]["dtype"] = str(deisa_arrays_dtype[ele])
             self.arrays[ele]["timedim"] = self.arrays[ele]["timedim"][0]
-            self.position = [self.arrays[ele]["starts"][i]//self.arrays[ele]["subsizes"][i]
+            self.position = [self.arrays[ele]["starts"][i] // self.arrays[ele]["subsizes"][i]
                              for i in range(len(np.array(self.arrays[ele]["sizes"])))]
         if rank == 0:
             # If and only if I have a perfect domain decomposition
@@ -234,7 +226,7 @@ class Bridge:
 
     def create_key(self, name):
         position = tuple(self.position)
-        return ("external-"+name, position)
+        return ("external-" + name, position)
 
     def publish_request(self, data_name, timestep):
         try:
@@ -248,18 +240,14 @@ class Bridge:
             return False
         elif isinstance(selection, (list, tuple)):
             starts = np.array(self.arrays[data_name]["starts"])
-            ends = np.array(self.arrays[data_name]["starts"]) + \
-                np.array(self.arrays[data_name]["subsizes"])
+            ends = np.array(self.arrays[data_name]["starts"]) + np.array(self.arrays[data_name]["subsizes"])
             sizes = np.array(self.arrays[data_name]["subsizes"])
 
             # if not needed timestep
-            if (
-                timestep >= selection[0][1]
-                or timestep < selection[0][0]
-                or (timestep - selection[0][0]) % selection[0][2] != 0
-            ):
+            if (timestep >= selection[0][1]
+                    or timestep < selection[0][0]
+                    or (timestep - selection[0][0]) % selection[0][2] != 0):
                 return False
-
             else:  # wanted timestep
                 for i in range(1, len(selection)):
                     s = selection[i]  # i is dim
@@ -276,22 +264,19 @@ class Bridge:
         if publish:
             key = self.create_key(data_name)
             shap = list(data.shape)
-            new_shape = tuple(shap[:self.arrays[data_name]["timedim"]] +
-                              [1]+shap[self.arrays[data_name]["timedim"]:])
+            new_shape = tuple(shap[:self.arrays[data_name]["timedim"]] + [1] + shap[self.arrays[data_name]["timedim"]:])
             # TODO will not copy, if not possible raise an error so handle it :p
             data.shape = new_shape
             ts = time.time()
 
-            tracer = trace.Trace(
-                count=0, trace=0, countfuncs=1, countcallers=1)
-            f = self.client.scatter(
-                data, direct=True, workers=self.workers, keys=[key], external=True)
-            while (f.status != 'finished' or f is None):
-                f = self.client.scatter(
-                    data, direct=True, workers=self.workers, keys=[key], external=True)
-            allstats = "stats_r"+str(self.rank)+".t"+str(timestep)
-            debug = "debug_r"+str(self.rank)+".t"+str(timestep)
-            callgrind = "callgrind_r"+str(self.rank)+".t"+str(timestep)
+            tracer = trace.Trace(count=0, trace=0, countfuncs=1, countcallers=1)
+            f = self.client.scatter(data, direct=True, workers=self.workers, keys=[key], external=True)
+            while f.status != 'finished' or f is None:
+                f = self.client.scatter(data, direct=True, workers=self.workers, keys=[key], external=True)
+
+            allstats = "stats_r" + str(self.rank) + ".t" + str(timestep)
+            debug = "debug_r" + str(self.rank) + ".t" + str(timestep)
+            callgrind = "callgrind_r" + str(self.rank) + ".t" + str(timestep)
 
             ts = time.time() - ts
             print("scatter et profiling  : ", ts, "secondes", flush=True)
@@ -339,12 +324,12 @@ class Adaptor:
         return self.client
 
     def create_array(self, name, shape, chunksize, dtype, timedim):
-        chunks_in_each_dim = [shape[i]//chunksize[i]
+        chunks_in_each_dim = [shape[i] // chunksize[i]
                               for i in range(len(shape))]
         lst = list(itertools.product(*[range(i) for i in chunks_in_each_dim]))
         items = []
         for m in lst:
-            f = Future(key=("external-"+name, m), inform=True, external=True)
+            f = Future(key=("external-" + name, m), inform=True, external=True)
             d = da.from_delayed(dask.delayed(f), shape=chunksize, dtype=dtype)
             items.append([list(m), d])
         ll = self.array_sort(items)
@@ -353,12 +338,12 @@ class Adaptor:
 
     # list arrays, one for each time step.
     def create_array_list(self, name, shape, chunksize, dtype, timedim):
-        chunks_in_each_dim = [shape[i]//chunksize[i]
+        chunks_in_each_dim = [shape[i] // chunksize[i]
                               for i in range(len(shape))]
         lst = list(itertools.product(*[range(i) for i in chunks_in_each_dim]))
         items = []
         for m in lst:
-            f = Future(key=("external-"+name, m), inform=True, external=True)
+            f = Future(key=("external-" + name, m), inform=True, external=True)
             d = da.from_delayed(dask.delayed(f), shape=chunksize, dtype=dtype)
             items.append([list(m), d])
         ll = self.array_sort(items)
