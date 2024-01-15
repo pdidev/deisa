@@ -61,7 +61,7 @@ setup(name='deisa',
           "dask~=2023.11.0",
           "numpy~=1.26.2",
           "pyyaml~=6.0.1",
-          # "distributed~=2021.11.2+1398.g9b7ce185"   # TODO
+          'distributed @ git+https://github.com/GueroudjiAmal/distributed@external'
       ],
 
       # tests_require=["unittest"],
