@@ -44,7 +44,7 @@ class Adaptor:
     client = None
     workers = []
 
-    def __init__(self, Sworker, scheduler_info):
+    def __init__(self, nb_workers: int, scheduler_info):
         with open(scheduler_info) as f:
             s = json.load(f)
         self.adr = s["address"]
@@ -64,7 +64,7 @@ class Adaptor:
         #   "distributed.workers.memory.terminate":0.99
         # })
         self.workers = list(self.client.scheduler_info()["workers"].keys())
-        while (len(self.workers) != Sworker):
+        while (len(self.workers) != nb_workers):
             self.workers = list(self.client.scheduler_info()["workers"].keys())
         Variable(DASK_VARIABLE_NAME_WORKERS).set(self.workers)
         print(self.workers, flush=True)
@@ -150,15 +150,11 @@ class Deisa(Adaptor):
     Instantiated in the client's analytics code.
     """
 
-    def __init__(self, scheduler_info, config, use_ucx=False):
+    def __init__(self, scheduler_info, nb_workers: int, use_ucx=False):
         if use_ucx:
             os.environ["DASK_DISTRIBUTED__COMM__UCX__INFINIBAND"] = "True"
 
-        with open(config) as file:
-            data = yaml.load(file, Loader=yaml.FullLoader)
-            workers = data["workers"]
-
-        super().__init__(workers, scheduler_info)
+        super().__init__(nb_workers, scheduler_info)
 
 
 def get_bridge_instance(sched_file, rank, size, arrays, deisa_arrays_dtype, **kwargs):
