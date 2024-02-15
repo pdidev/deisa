@@ -18,13 +18,14 @@ import trace
 import dask
 import dask.array as da
 import numpy as np
-import yaml
 from dask.array import Array
-from dask.distributed import Client, Queue, Future, Variable
+from dask.distributed import Client, Queue, Future, Variable, Lock
 
 from deisa.__version__ import __version__
 
 DASK_VARIABLE_NAME_WORKERS = "workers"
+DASK_LOCK_NB_BRIDGES = "nb-bridges-lock"
+DASK_VARIABLE_NB_BRIDGES = "nb-bridges"
 DASK_QUEUE_NAME_QUEUE = "queue"
 
 DEISA_ARRAY_SIZE = "sizes"
@@ -50,11 +51,11 @@ class Adaptor:
         self.adr = s["address"]
         try:
             self.client = Client(self.adr)
-        except Exception as e:
+        except Exception as _:
             # TODO: retry N times.
             print("retrying ...", flush=True)
             self.client = Client(self.adr)
-
+ 
         # Check if client version is compatible with scheduler version
         self.client.get_versions(check=True)
         # dask.config.set({
@@ -132,8 +133,9 @@ class Adaptor:
         return arrays
 
     def get_deisa_arrays(self):
+        assert(self.client is not None)
         arrays = dict()
-        arrays_desc = Queue("Arrays").get()
+        arrays_desc = Queue("Arrays", client=self.client).get()
         for name in arrays_desc:
             arrays[name] = self.create_array(
                 name,
@@ -143,6 +145,16 @@ class Adaptor:
                 arrays_desc[name][DEISA_ARRAY_TIME_DIMENSION]
             )
         return deisa_arrays(arrays)
+    
+    def wait_for_last_bridge_and_shutdown(self, delay=2):
+        assert(self.client is not None)
+
+        nb_bridge = Variable(DASK_VARIABLE_NB_BRIDGES).get()
+        if nb_bridge == 0:
+            self.client.shutdown()
+        else:
+            time.sleep(delay)
+            self.wait_for_last_bridge_and_shutdown(delay=delay)
 
 
 class Deisa(Adaptor):
@@ -179,6 +191,9 @@ class Bridge:
         self.rank = rank
         self.contract = None
 
+        assert(self.client is not None)
+        self.nb_bridges = Variable(DASK_VARIABLE_NB_BRIDGES, client=self.client)
+
         workers = Variable(DASK_VARIABLE_NAME_WORKERS).get()
         if size > len(workers):  # more processes than workers
             self.workers = [workers[rank % len(workers)]]
@@ -195,6 +210,18 @@ class Bridge:
         if rank == 0:
             # If and only if I have a perfect domain decomposition
             Queue("Arrays").put(self.arrays)
+            self.nb_bridges.set(1)
+        else:
+            with Lock(DASK_LOCK_NB_BRIDGES, client=self.client):
+                i = self.nb_bridges.get()
+                self.nb_bridges.set(i+1)
+
+    def release(self):
+        if self.client and self.nb_bridges:
+            print("release called", flush=True)
+            with Lock(DASK_LOCK_NB_BRIDGES, client=self.client):
+                self.nb_bridges.set(self.nb_bridges.get(timeout="500ms") - 1) # note: this should never throw a timeouterror because nb_bridges is always set
+                print("nb bridges=" + str(self.nb_bridges.get()))
 
     def create_key(self, name):
         position = tuple(self.position)
@@ -272,7 +299,7 @@ class Bridge:
         adr = s["address"]
         try:
             client = Client(adr)
-        except Exception as e:
+        except Exception as _:
             print("retrying ...", flush=True)  # TODO: retry N times
             client = Client(adr)
         return client
