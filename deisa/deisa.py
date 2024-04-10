@@ -261,7 +261,7 @@ class Bridge:
     Called from PDI's deisa plugin.
     This method should not print anything to stdout.
     """
-    def publish_data(self, data, data_name, timestep, debug=False):
+    def publish_data(self, data, data_name, timestep, debug=__debug__):
 
         if self.contract is None:
             self.contract = Variable("Contract").get()
@@ -275,7 +275,7 @@ class Bridge:
             # TODO will not copy, if not possible raise an error so handle it :p
             data.shape = new_shape
 
-            if __debug__ or debug:
+            if debug:
                 ts = time.time()
                 tracer = trace.Trace(count=0, trace=0, countfuncs=1, countcallers=1)
 
