@@ -12,6 +12,7 @@
 from deisa import Deisa
 from dask.distributed import performance_report, wait
 import os
+import yaml
 
 os.environ["DASK_DISTRIBUTED__COMM__UCX__INFINIBAND"] = "True"
 
@@ -19,8 +20,12 @@ os.environ["DASK_DISTRIBUTED__COMM__UCX__INFINIBAND"] = "True"
 scheduler_info = 'scheduler.json'
 config_file = 'config.yml'
 
+with open(config_file, "r") as f:
+    cfg = yaml.safe_load(f)
+nb_workers = cfg["workers"]
+
 # Initialize Deisa
-Deisa = Deisa(scheduler_info, config_file)
+Deisa = Deisa(scheduler_info, nb_workers)
 
 # Get client
 client = Deisa.get_client()
