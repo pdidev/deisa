@@ -59,8 +59,6 @@ setup(name='deisa',
 
       install_requires=[
           "dask~=2023.11.0",
-          "numpy~=1.26.2",
-          "pyyaml~=6.0.1",
           'distributed @ git+https://github.com/GueroudjiAmal/distributed@external'
       ],
 
