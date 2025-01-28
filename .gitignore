@@ -2,3 +2,8 @@ cmake-build-*
 .idea/
 .vscode/
 build/
+.direnv/
+.pytest_cache/
+test/__pycache__/
+deisa/__pycache__/
+deisa.egg-info/

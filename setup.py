@@ -20,6 +20,7 @@ def find_version(*file_paths):
             return fp.read().strip()
 
     import re
+
     version_file = read(*file_paths)
     version_match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]", version_file, re.M)
     if version_match:
@@ -28,49 +29,39 @@ def find_version(*file_paths):
 
 
 def readme():
-    with open('README.md', 'r') as f:
+    with open("README.md", "r") as f:
         return f.read()
 
 
 version = find_version("deisa", "__version__.py")
 
-setup(name='deisa',
-      version=version,
-
-      description='Deisa: Dask-Enabled In Situ Analytics',
-      long_description=readme(),
-      long_description_content_type='text/markdown',
-      license='MIT',
-
-      url='https://github.com/pdidev/deisa',
-      project_urls={
-          'Bug Reports': 'https://github.com/pdidev/deisa/issues',
-          'Source': 'https://github.com/pdidev/deisa',
-      },
-
-      author='A. Gueroudji',
-      author_email='amal.gueroudji@cea.fr',
-
-      python_requires='>=3.9',
-
-      keywords='deisa in-situ',
-
-      packages=['deisa'],
-
-      install_requires=[
-          "dask~=2023.11.0",
-          "numpy~=1.26.2",
-          "pyyaml~=6.0.1",
-          'distributed @ git+https://github.com/GueroudjiAmal/distributed@external'
-      ],
-
-      # tests_require=["unittest"],
-      # test_suite='test',
-
-      classifiers=[
-          "Programming Language :: Python :: 3.9",
-          "License :: OSI Approved :: MIT License",
-          "Operating System :: OS Independent",
-          "Development Status :: 3 - Alpha"
-      ]
-      )
+setup(
+    name="deisa",
+    version=version,
+    description="Deisa: Dask-Enabled In Situ Analytics",
+    long_description=readme(),
+    long_description_content_type="text/markdown",
+    license="MIT",
+    url="https://github.com/pdidev/deisa",
+    project_urls={
+        "Bug Reports": "https://github.com/pdidev/deisa/issues",
+        "Source": "https://github.com/pdidev/deisa",
+    },
+    author="A. Gueroudji",
+    author_email="amal.gueroudji@cea.fr",
+    python_requires=">=3.9",
+    keywords="deisa in-situ",
+    packages=["deisa"],
+    install_requires=[
+        "dask",
+        "distributed",
+    ],
+    # tests_require=["unittest"],
+    # test_suite='test',
+    classifiers=[
+        "Programming Language :: Python :: 3.9",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+        "Development Status :: 3 - Alpha",
+    ],
+)
