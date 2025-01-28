@@ -9,39 +9,47 @@
 #
 ###################################################################################################
 
-from deisa import Deisa
+from deisa import Deisa, DeisaArrays
 from dask.distributed import performance_report, wait
 import os
 import yaml
+import dask
 
 os.environ["DASK_DISTRIBUTED__COMM__UCX__INFINIBAND"] = "True"
 
 # Scheduler file name and configuration file
 scheduler_info = 'scheduler.json'
 config_file = 'config.yml'
-
 with open(config_file, "r") as f:
     cfg = yaml.safe_load(f)
+
 nb_workers = cfg["workers"]
 
 # Initialize Deisa
-Deisa = Deisa(scheduler_info, nb_workers)
+adaptor = Deisa(nb_workers = nb_workers, scheduler_file_name = scheduler_info)
+
+# DEISA API
 
 # Get client
-client = Deisa.get_client()
+client = adaptor.get_client()
 
-# either: Get data descriptor as a list of Deisa arrays object
-arrays = Deisa.get_deisa_arrays()
-# or: Get data descriptor as a dict of Dask array
-# arrays = Deisa.get_dask_arrays()
+arrays: DeisaArrays = adaptor.get_deisa_arrays()
 
-# Select data
-gt = arrays["global_t"][...]
-print(gt, flush=True)
+##### API CHANGE
+# force user to make more clear per dimension what we are selecting. 
+# remove support for [...] which is more prone to bugs.
+#####
 
-# Check contract
-arrays.check_contract()
+# Select data - sets self.selection
+gt = arrays["global_t"][:, : , :]
 
+# handle contract - contract stays the same
+arrays.handle_contract()
+
+# or, for more fine grained control if user needs to dynamically change 
+# the contract
+# arrays.generate_contract()
+# arrays.share_contract()
 
 def Derivee(F, dx):
     """
@@ -56,20 +64,22 @@ def Derivee(F, dx):
 
 
 # py-bokeh is needed if you wanna see the perf report
-with performance_report(filename="dask-report.html"):
+with performance_report(filename="dask-report.html"), dask.config.set(array_optimize=None):
 
-    # Construct a lazy task graph
+    # Construct a lazy task graph 
     cpt = Derivee(gt, 1).mean()
 
     # Submit the task graph to the scheduler
-    s = client.persist(cpt, release=True)
+    # scheduler gets the graph and doesnt do anything yet.
+    s = cpt.compute()
 
-    # Sign contract
-    arrays.validate_contract()
+    arrays.gc()
+
     del gt
     # Print the result, note that "s" is a future object, to get the result of the computation,
     # we call `s.result()` to retreive it.
-    print(client.compute(s).result(), flush=True)
+    print(f"Derivative computation is {s}", flush=True)
+
 
 print("Done", flush=True)
-client.shutdown()
+adaptor.wait_for_last_bridge_and_shutdown()
