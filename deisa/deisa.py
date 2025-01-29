@@ -14,7 +14,7 @@ from numpy.typing import NDArray, DTypeLike
 
 # dask
 from dask.array import Array  # type: ignore
-from dask.distributed import Client, Queue, Variable, Worker
+from dask.distributed import Client, Queue, Variable, Worker, Lock
 from dask.distributed import wait
 from dask.distributed import worker_client
 from dask.highlevelgraph import HighLevelGraph
@@ -25,6 +25,7 @@ from typing import NewType, Optional
 import itertools
 import json
 import os
+import time
 
 
 # Dask related
@@ -34,6 +35,8 @@ ARRAYS_NAME = "arrays"
 # Bridge and lock related
 BRIDGE_LOCK_NAME = "nb-bridges-lock"
 NB_BRIDGES_NAME = "nb-bridges"
+DASK_VARIABLE_NB_BRIDGES = "nb-bridges"
+DASK_LOCK_NB_BRIDGES = "nb-bridges-lock"
 
 # Contract variable name
 CONTRACT_NAME = "contract"
@@ -587,7 +590,7 @@ class Deisa:
         custom_gt = da.Array(dsk, name, chunks, dtype)
         return custom_gt
 
-    def wait_for_last_bridge_and_shutdown(self):
+    def wait_for_last_bridge_and_shutdown(self, delay=2):
         """
         Called by client to wait for all bridges to shutdown before
         trying to shutdown the main client.
@@ -596,8 +599,14 @@ class Deisa:
         ----------
             - delay: how much time to wait before checking again if bridges are all shutdown.
         """
-        assert self.client is not None
-        self.client.shutdown()
+        assert(self.client is not None)
+
+        nb_bridge = Variable(DASK_VARIABLE_NB_BRIDGES).get()
+        if nb_bridge == 0:
+            self.client.shutdown()
+        else:
+            time.sleep(delay)
+            self.wait_for_last_bridge_and_shutdown(delay=delay)
 
 
 class BridgeV1:
@@ -687,6 +696,8 @@ class BridgeV1:
 
         self.shared_data: dict[str, dict] = arrays_description
         self.shared_data_dtype: dict = arrays_description_dtype
+        
+        self.nb_bridges = Variable(DASK_VARIABLE_NB_BRIDGES, client=self.client)
 
         for array_name in self.shared_data.keys():
 
@@ -701,14 +712,14 @@ class BridgeV1:
             ][TIME_DIMENSION_NAME][0]
 
         if self.mpi_rank == 0:
-            # share MPI size among all clients. I am sure that all of them are connected since
-            # we have an assert above.
-            self.nb_bridges = Variable(NB_BRIDGES_NAME, client=self.client).set(
-                self.mpi_size
-            )
             # Share the description. Since we only need info for size and subsize, only rank0
             # needs to share.
             Queue(ARRAYS_NAME).put(self.shared_data)
+            self.nb_bridges.set(1)
+        else:
+            with Lock(DASK_LOCK_NB_BRIDGES, client=self.client):
+                i = self.nb_bridges.get()
+                self.nb_bridges.set(i+1)
 
         # Contract of each bridge.
         self.contract = None
@@ -813,5 +824,8 @@ class BridgeV1:
         self.queues[shared_array_name].put(f)
 
     def release(self):
-        # TODO remnant of previous version.
-        pass
+        if self.client and self.nb_bridges:
+            print("release called", flush=True)
+            with Lock(DASK_LOCK_NB_BRIDGES, client=self.client):
+                self.nb_bridges.set(self.nb_bridges.get(timeout="500ms") - 1) # note: this should never throw a timeouterror because nb_bridges is always set
+                print("nb bridges=" + str(self.nb_bridges.get()))
