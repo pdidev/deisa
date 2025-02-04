@@ -14,7 +14,7 @@ from numpy.typing import NDArray, DTypeLike
 
 # dask
 from dask.array import Array  # type: ignore
-from dask.distributed import Client, Queue, Variable, Worker
+from dask.distributed import Client, Queue, Variable, Worker, Lock
 from dask.distributed import wait
 from dask.distributed import worker_client
 from dask.highlevelgraph import HighLevelGraph
@@ -25,6 +25,7 @@ from typing import NewType, Optional
 import itertools
 import json
 import os
+import time
 
 
 # Dask related
@@ -587,7 +588,7 @@ class Deisa:
         custom_gt = da.Array(dsk, name, chunks, dtype)
         return custom_gt
 
-    def wait_for_last_bridge_and_shutdown(self):
+    def wait_for_last_bridge_and_shutdown(self, delay=2):
         """
         Called by client to wait for all bridges to shutdown before
         trying to shutdown the main client.
@@ -597,7 +598,13 @@ class Deisa:
             - delay: how much time to wait before checking again if bridges are all shutdown.
         """
         assert self.client is not None
-        self.client.shutdown()
+        nb_bridges_still_active = Variable(NB_BRIDGES_NAME).get()
+        if nb_bridges_still_active == 0:
+            # shutdown last client and whole cluster
+            self.client.shutdown()
+        else:
+            time.sleep(delay)
+            self.wait_for_last_bridge_and_shutdown(delay=delay)
 
 
 class BridgeV1:
@@ -672,7 +679,7 @@ class BridgeV1:
             self.client: Client = Client(scheduler_address)
         else:
             raise RuntimeError(
-                "Must initialize Bridge with cluster object, scheudler encoding,"
+                "Must initialize Bridge with cluster object, scheduler encoding,"
                 "or scheduler address."
             )
 
@@ -813,5 +820,18 @@ class BridgeV1:
         self.queues[shared_array_name].put(f)
 
     def release(self):
-        # TODO remnant of previous version.
-        pass
+        # print(f"Release called from rank {self.mpi_rank}", flush=True)
+        with Lock(BRIDGE_LOCK_NAME, client=self.client):
+            # shut down client gracefully
+            # get number of bridges to reduce by one
+            var_nb_bridges = Variable(NB_BRIDGES_NAME)
+            nb_bridges = var_nb_bridges.get(timeout="500ms")
+
+            # reduce number of bridges by one since this client shut down
+            var_nb_bridges.set(nb_bridges - 1)
+            # print("nb bridges=" + str(var_nb_bridges.get()))
+
+        # this call has to be outside of with context manager otherwise I get IO loop closed error.
+        # basically the client has to inform the scheduler that lock is free, but if I close the
+        # client this is impossible to do.
+        self.client.close(timeout=5)
