@@ -35,6 +35,8 @@ ARRAYS_NAME = "arrays"
 # Bridge and lock related
 BRIDGE_LOCK_NAME = "nb-bridges-lock"
 NB_BRIDGES_NAME = "nb-bridges"
+DASK_VARIABLE_NB_BRIDGES = "nb-bridges"
+DASK_LOCK_NB_BRIDGES = "nb-bridges-lock"
 
 # Contract variable name
 CONTRACT_NAME = "contract"
@@ -694,6 +696,8 @@ class BridgeV1:
 
         self.shared_data: dict[str, dict] = arrays_description
         self.shared_data_dtype: dict = arrays_description_dtype
+        
+        self.nb_bridges = Variable(DASK_VARIABLE_NB_BRIDGES, client=self.client)
 
         for array_name in self.shared_data.keys():
 
@@ -708,14 +712,14 @@ class BridgeV1:
             ][TIME_DIMENSION_NAME][0]
 
         if self.mpi_rank == 0:
-            # share MPI size among all clients. I am sure that all of them are connected since
-            # we have an assert above.
-            self.nb_bridges = Variable(NB_BRIDGES_NAME, client=self.client).set(
-                self.mpi_size
-            )
             # Share the description. Since we only need info for size and subsize, only rank0
             # needs to share.
             Queue(ARRAYS_NAME).put(self.shared_data)
+            self.nb_bridges.set(1)
+        else:
+            with Lock(DASK_LOCK_NB_BRIDGES, client=self.client):
+                i = self.nb_bridges.get()
+                self.nb_bridges.set(i+1)
 
         # Contract of each bridge.
         self.contract = None
