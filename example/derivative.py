@@ -9,7 +9,7 @@
 #
 ###################################################################################################
 
-from deisa import Deisa, DeisaArrays
+from deisa import Deisa
 from dask.distributed import performance_report, wait
 import os
 import yaml
@@ -18,38 +18,23 @@ import dask
 os.environ["DASK_DISTRIBUTED__COMM__UCX__INFINIBAND"] = "True"
 
 # Scheduler file name and configuration file
-scheduler_info = 'scheduler.json'
-config_file = 'config.yml'
+scheduler_info = "scheduler.json"
+config_file = "config.yml"
 with open(config_file, "r") as f:
     cfg = yaml.safe_load(f)
 
-nb_workers = cfg["workers"]
+nb_dask_workers = cfg["workers"]
 
 # Initialize Deisa
-adaptor = Deisa(nb_workers = nb_workers, scheduler_file_name = scheduler_info)
+adaptor = Deisa(
+    nb_expected_dask_workers=nb_dask_workers, scheduler_file_name=scheduler_info
+)
 
 # DEISA API
 
 # Get client
-client = adaptor.get_client()
+client = adaptor.client
 
-arrays: DeisaArrays = adaptor.get_deisa_arrays()
-
-##### API CHANGE
-# force user to make more clear per dimension what we are selecting. 
-# remove support for [...] which is more prone to bugs.
-#####
-
-# Select data - sets self.selection
-gt = arrays["global_t"][:, : , :]
-
-# handle contract - contract stays the same
-arrays.handle_contract()
-
-# or, for more fine grained control if user needs to dynamically change 
-# the contract
-# arrays.generate_contract()
-# arrays.share_contract()
 
 def Derivee(F, dx):
     """
@@ -58,24 +43,28 @@ def Derivee(F, dx):
               dx       = step of the variable for derivative
        Output: dFdx = first derivative of F
     """
-    c0 = 2. / 3.
-    dFdx = c0 / dx * (F[3: - 1] - F[1: - 3] - (F[4:] - F[:- 4]) / 8.)
+    c0 = 2.0 / 3.0
+    dFdx = c0 / dx * (F[3:-1] - F[1:-3] - (F[4:] - F[:-4]) / 8.0)
     return dFdx
 
 
 # py-bokeh is needed if you wanna see the perf report
-with performance_report(filename="dask-report.html"), dask.config.set(array_optimize=None):
+with performance_report(filename="dask-report.html"), dask.config.set( # type: ignore
+    array_optimize=None
+):
+    # only 3 chunks needed in dim0, and 1 chunk in dim1
+    gt = adaptor["global_t", :, :, :]
+    adaptor.ready()
+    # print(gt.compute())
 
-    # Construct a lazy task graph 
+    # Construct a lazy task graph
     cpt = Derivee(gt, 1).mean()
 
     # Submit the task graph to the scheduler
     # scheduler gets the graph and doesnt do anything yet.
     s = cpt.compute()
 
-    arrays.gc()
-
-    del gt
+    # del gt
     # Print the result, note that "s" is a future object, to get the result of the computation,
     # we call `s.result()` to retreive it.
     print(f"Derivative computation is {s}", flush=True)

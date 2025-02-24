@@ -12,25 +12,25 @@
 import numpy as np
 from numpy.typing import NDArray, DTypeLike
 
-# dask
 from dask.array import Array  # type: ignore
-from dask.distributed import Client, Queue, Variable, Worker, Lock
-from dask.distributed import wait
+from dask.distributed import Client, Queue, Variable, Worker, Lock, Event
+from dask.distributed import wait, get_worker
 from dask.distributed import worker_client
 from dask.highlevelgraph import HighLevelGraph
 import dask
 import dask.array as da
 from collections import namedtuple, defaultdict
-from typing import NewType, Optional
+from typing import NewType, Optional, Set, List, Tuple, Union, Dict
+import warnings
+import logging
 import itertools
 import json
 import os
 import time
 
-
 # Dask related
 WORKERS_NAME = "workers"
-ARRAYS_NAME = "arrays"
+ARRAYS_METADATA = "arrays-metadata"
 
 # Bridge and lock related
 BRIDGE_LOCK_NAME = "nb-bridges-lock"
@@ -50,34 +50,41 @@ START_NAME = "starts"
 # in Dask complaining it is not msgPack-encodable. Namedtuple gets past this.
 MySlice = namedtuple("MySlice", ["start", "stop", "step"])
 
-# Type for full specification of dimensions - a list of MySlice. The list must have len==dims of
-# the array being shared by PDI. So a 3D array (including time dimension) corresponds to a list of
-# 3 MySlice instances.
-DimsSpec = NewType("DimsSpec", list[MySlice])
-
-# A contract is a dictionary of key-value pairs where the keys are the names of the array being
-# shared by PDI and the values are an instance of DimsSpec.
-# Ex:
-# {
-# "global_t": [MySlice(0,200,1), MySlice(20,100,2)]
-# "global_f": [MySlice(10,500,1), MySlice(0,10,1)]
-# }
-ContractType = NewType("ContractType", dict[str, DimsSpec])
+# A ValidContract is a list of MySlice types for each dimension of the array.
+ValidContract = NewType("ValidContract", List[MySlice])
+# A NullContract is just None - It cant be a list of None because when slicing, this is interpreted
+# as [0,end,1]
+NullContract = NewType("NullContract", None)
+# A contract is either a ValidContract or a NullContract
+Contract = Union[ValidContract, NullContract]
 
 
-class ContractError(Exception):
+def mapping_mpi_procs_to_dask_workers(mpi_size: int, dask_workers: list[str]):
     """
-    Error class designed to alert user that the contract has been mishandled.
+    Determine mapping of MPI ranks to corresponding Dask workers. This function can be overriden
+    by the user to whatever mapping they desire.
+
+    Output
+    ----------
+        - Dictionary of MPI rank number to list of IP addresses of Dask Workers.
     """
 
-    def __init__(self, message):
-        super().__init__(message)
+    if len(dask_workers) > mpi_size:
+        raise RuntimeError(
+            "There are more Dask workers than MPI processes. There must be less"
+            "(or the equal) Dask workers than MPI processes. "
+        )
 
-    def __str__(self) -> str:
-        return super().__str__()
+    mapping = {}
+    for rank in range(mpi_size):
+        mapping[rank] = [dask_workers[rank % len(dask_workers)]]
+
+    return mapping
 
 
-def create_client_connected_to_scheduler_at(scheduler_address: str) -> Client:
+def create_client_connected_to_scheduler_at(
+    scheduler_address: str, max_retries=10
+) -> Client:
     """
     Create a client and connect to a Dask scheduler at a given address.
 
@@ -93,19 +100,30 @@ def create_client_connected_to_scheduler_at(scheduler_address: str) -> Client:
         client = Client(scheduler_address)
         return client
     except Exception as e:
-        print(
+        warnings.warn(
             f"Failed to create a client connected to scheduler at {scheduler_address}"
             f"because of: \n{e}\nRetrying connection...\n"
         )
-        return create_client_connected_to_scheduler_at(scheduler_address)
+        if max_retries == 0:
+            raise RuntimeError(
+                "Unable to connect to scheduler. Make sure the scheduler is running. Exiting..."
+            )
+        return create_client_connected_to_scheduler_at(
+            scheduler_address, max_retries=(max_retries - 1)
+        )
+
+
+def qname_from(array_name: str, rank: int) -> str:
+    """Return queue name from array name and rank in fixed scheme."""
+    return str(array_name) + "-rank" + str(rank)
 
 
 def get_bridge_instance(
-    sched_file: list[int],
+    sched_file: List[int],
     mpi_rank: int,
     mpi_size: int,
-    arrays_description: dict[str, dict],
-    arrays_description_dtype: dict[str, DTypeLike],
+    arrays_description: Dict[str, Dict],
+    arrays_description_dtype: Dict[str, DTypeLike],
     **kwargs,
 ):
     """
@@ -151,227 +169,201 @@ def get_bridge_instance(
         scheduler_encoding=sched_file,
         mpi_rank=mpi_rank,
         mpi_size=mpi_size,
-        arrays_description=arrays_description,
-        arrays_description_dtype=arrays_description_dtype,
+        arrays_metadata=arrays_description,
+        arrays_metadata_dtype=arrays_description_dtype,
         **kwargs,
     )
 
 
-class DeisaArray:
+def create_null_contract_for_all_arrays(arrays_metadata) -> Dict[str, Contract]:
     """
-    Class which contains the name of the dask array being shared and the dask array itself.
-    It is responsible for setting the contract that will specify which data we want in each
-    dimension.
-
-    The dask array it contains is a "global" view of the data shared by all MPI
-    processes. In other words, if 4 MPI processes are each sharing a (100, 100) array
-    (which are subparts of a grid divided in 2x2) at each timestep, for 5 timesteps, the
-    corresponding DeisaArray will have a dask array which will have shape (5, 200, 200).
+    Creates a null contract for all arrays. In the beginning this is the default for all
+    arrays being shared.
     """
-
-    def __init__(self, name: str, array: Array):
-        """
-        Initialize a DeisaArray object.
-
-        Parameters
-        ----------
-            - name: the name of the array.
-            - array: the Dask array we are sharing.
-            - selection: a list of slices per dimension of the array. It is used to select the data
-            that the user needs in each dimension. In this way, PDI knows that to share and what to
-            avoid sharing.
-        """
-        self.name = name
-        self.array = array
-        # default selection is None, i.e. we dont need the data.
-        # TODO currently contracts are not supported, so setting this doesn't do anything.
-        self.selection: Optional[DimsSpec] = None
-
-    def normalize_slice(
-        self,
-        slice_start: int | None,
-        slice_end: int | None,
-        slice_step: int | None,
-        dim: int,
-    ) -> MySlice:
-        """
-        Applies slicing rules along a specific axis/index of the array.
-
-        Parameters
-        ----------
-            - slice_start: starting index of the slice.
-            - slice_end: end index of the slice.
-            - slice_step: step of the slice.
-            - dim: dimension/axis over which slicing occurs.
-
-        Output
-        ----------
-            - A MySlice object i.e a namedtuple[int,int,int] which represents the slice start, end,
-            and step in the specified dimension.
-        """
-        shape: tuple[int] = self.array.shape
-
-        if slice_start is None:
-            slice_start = 0
-        elif slice_start < 0:
-            slice_start = shape[dim] + slice_start
-
-        if slice_end is None:
-            slice_end = shape[dim]
-        elif slice_end < 0:
-            slice_end = shape[dim] + slice_end
-
-        if slice_step is None:
-            slice_step = 1
-        elif slice_step < 0:
-            raise ValueError(f"{slice_step} only positive step values are accepted")
-
-        return MySlice(slice_start, slice_end, slice_step)
-
-    def __getitem__(self, idx: tuple) -> Array:
-        """
-        Support basic dask syntax for slicing and sets the selection variable which is used
-        to generate a contract.
-
-        Parameters
-        ----------
-            - idx: tuple of mix of slice or int or ellipsis (at most one).
-            Ex: [:, 1, ..., some_start : some_end : some_step]
-
-        Output
-        ----------
-            - A subset of the array which matches the idx(s) requested.
-        """
-        selection = []
-
-        ellipsis_counter = 0
-        for i in range(len(idx)):
-            if isinstance(idx[i], slice):
-                new_selection: MySlice = self.normalize_slice(
-                    idx[i].start, idx[i].stop, idx[i].step, i
-                )
-                selection.append(new_selection)
-            elif isinstance(idx[i], int):
-                if idx[i] >= 0:
-                    selection.append(MySlice(idx[i], idx[i] + 1, 1))
-                else:
-                    selec0 = idx[i] + self.array.shape[i]
-                    selection.append(MySlice(selec0, selec0 + 1, 1))
-            elif isinstance(idx[i], type(Ellipsis)):
-                if ellipsis_counter == 0:
-                    new_selection: MySlice = self.normalize_slice(0, None, 1, i)
-                    selection.append(new_selection)
-                    ellipsis_counter += 1
-                else:
-                    # This is a possible bug in Dask:
-                    # given a 3D dask array "a",
-                    # a[:,:,:] works
-                    # a[..., : , :] works
-                    # a[..., ..., ...] gives an error
-                    # a[..., ..., :] gives an error
-                    # a[..., :, ...] gives an error
-                    # so it seems to only handle one ellipse type. Therefore, to avoid upstream
-                    # errors, we do the same.
-                    raise ValueError("Only one use of Ellipsis allowed.")
-
-        # build a dims specification type and set the selection to it.
-        self.selection = DimsSpec(selection)
-        return self.array.__getitem__(idx)
-
-    def gc(self):
-        """
-        Garbage collect the DeisaArray by deleting it from memory.
-        """
-        del self.array
+    arrays_contract: Dict[str, Contract] = {}
+    for name in arrays_metadata:
+        arrays_contract[name] = NullContract(None)
+    return arrays_contract
 
 
-# TODO this class could probably be moved inside the Deisa since it just serves as a container of
-# DeisaArray objects.
-class DeisaArrays:
+def normalize_slice(
+    slice_start: int | None,
+    slice_end: int | None,
+    slice_step: int | None,
+    shape_at_dim: int,
+) -> MySlice:
     """
-    Container class of DeisaArray objects.
+    Applies slicing rules along a specific axis/index of the array.
+
+    Parameters
+    ----------
+        - slice_start: starting index of the slice.
+        - slice_end: end index of the slice.
+        - slice_step: step of the slice.
+        - dim: dimension/axis over which slicing occurs.
+
+    Output
+    ----------
+        - A MySlice object i.e a namedtuple[int,int,int] which represents the slice start, end,
+        and step in the specified dimension.
     """
 
-    def __init__(self, arrays: dict[str, Array]):
-        """
-        Initialize DeisaArrays class.
+    if slice_start is None:
+        slice_start = 0
+    elif slice_start < 0:
+        slice_start = shape_at_dim + slice_start
 
-        Parameters
-        ----------
-            - arrays: dictionary of key-value where the key is the name of the global array being
-            shared and the value is the Dask Array.
-            Ex:
-            {
-                "global_t": dask.Array(...)
-                "temperature": dask.Array(...)
-            }
-        """
-        self.arrays = []
-        for shared_array_name, shared_array in arrays.items():
-            self.arrays.append(DeisaArray(shared_array_name, shared_array))
+    if slice_end is None:
+        slice_end = shape_at_dim
+    elif slice_end < 0:
+        slice_end = shape_at_dim + slice_end
 
-        self.contract: Optional[ContractType] = None
+    if slice_step is None:
+        slice_step = 1
+    elif slice_step < 0:
+        raise ValueError(f"{slice_step} only positive step values are accepted")
 
-    def __getitem__(self, name: str) -> DeisaArray:
-        """
-        Retrieve a specific DeisaArray with a name.
+    return MySlice(slice_start, slice_end, slice_step)
 
-        Parameters
-        ----------
-            - name: name of DeisaArray we want to retrieve.
 
-        Output
-        ----------
-            - DeisaArray corresponding to the desired name.
-        """
-        for deisa_array in self.arrays:
-            if deisa_array.name == name:
-                return deisa_array
-        raise ValueError(f"{name} array does not exist in Deisa data store.")
+def create_valid_contract(
+    array_name: str, keys: tuple, array_metadata: Dict
+) -> ValidContract:
+    """
+    Support basic dask syntax for slicing and sets the selection variable which is used
+    to generate a contract.
 
-    # TODO with the new solution, contracts are not handled yet.
-    def handle_contract(self):
-        """
-        Generate and share the contract. Used in cases where the user will not change the contract
-        during the course of the analytics.
-        """
-        self.generate_contract()
-        self.share_contract()
+    Parameters
+    ----------
+        - array_name: name of the array.
+        - keys: a tuple of indexes the user requested (per array dimension).
+          Ex: (:, 1, ..., some_start : some_end : some_step)
+        - array_metadata: the metadata of the array.
 
-    # TODO with the new solution, contracts are not handled yet.
-    def generate_contract(self) -> ContractType:
-        """
-        Generate the contract. For each DeisaArray object, we store the name and selection as
-        key-value pairs.
+    Output
+    ----------
+        - A subset of the array which matches the keys requested.
+    """
+    selection = []
 
-        Output
-        ----------
-            - A dictionary of key-value pairs consisting of the name of the array and the selection.
-        """
-        contract = {}
-        for deisa_array in self.arrays:
-            contract[deisa_array.name] = deisa_array.selection
+    error_msg = f""" Only {len(keys)} dimensions selected for {array_name}. Array is 
+        {len(array_metadata[SIZE_NAME])}-dimensional. Please select data in all dimensions 
+        (':' is accepted).
+    """
 
-        self.contract = ContractType(contract)
-        print("Generated contract", self.contract, flush=True)
-        return self.contract
+    assert len(keys) == len(array_metadata[SIZE_NAME]), error_msg
 
-    # TODO with the new solution, contracts are not handled yet.
-    def share_contract(self):
-        """
-        Create a global variable that is shared among all clients effectively setting the contract.
-        The contract is then read by PDI in the "is_contract_satisfied" method of the Bridge instance
-        to know when/what to share.
-        """
-        Variable(CONTRACT_NAME).set(self.contract)
-        print("Contract has been shared with all clients.", flush=True)
+    ellipsis_counter = 0
+    for i in range(len(keys)):
+        if isinstance(keys[i], slice):
+            new_selection: MySlice = normalize_slice(
+                keys[i].start,
+                keys[i].stop,
+                keys[i].step,
+                int(array_metadata[SIZE_NAME][i]),
+            )
+            selection.append(new_selection)
+        elif isinstance(keys[i], int):
+            if keys[i] >= 0:
+                selection.append(MySlice(keys[i], keys[i] + 1, 1))
+            else:
+                selec0 = keys[i] + int(array_metadata[SIZE_NAME][i])
+                selection.append(MySlice(selec0, selec0 + 1, 1))
+        elif isinstance(keys[i], type(Ellipsis)):
+            if ellipsis_counter == 0:
+                selection.append(MySlice(0, int(array_metadata[SIZE_NAME][i]), 1))
+                ellipsis_counter += 1
+            else:
+                # Dask only allows 1 ellipsis, so we maintain a similar API.
+                raise ValueError("Only one use of Ellipsis allowed.")
+        else:
+            raise RuntimeError(
+                "Only slice, int, or at ellipsis (at most one) is allowed in data selection."
+            )
 
-    def gc(self):
-        """
-        Garbage collect all the DeisaArray objects in the list.
-        """
-        for deisa_array in self.arrays:
-            deisa_array.gc()
+    return ValidContract(selection)
+
+
+def efficient_chunks_for_dimension(
+    start: int, end: int, step: int, chunk_size: int
+) -> Set[int]:
+    """
+    Compute the set of chunk indices touched by a slice in one dimension
+    without iterating over every slice element. This version uses a for loop
+    over candidate chunk indices.
+
+    The slice is defined by:
+      - start: start index
+      - end: stop index (exclusive) [assumed b > a]
+      - step: step (assumed positive)
+
+    chunk_size is the chunk size along this dimension. An array index i belongs to chunk i // d.
+
+    Returns:
+      A set of chunk indices that the arithmetic progression
+      (start, start+step, start+2step, …, end) touches.
+    """
+    # Compute the total number of elements in the slice using ceiling division.
+    # This is equivalent to math.ceil((b - a) / c)
+    n: int = (end - start + step - 1) // step
+
+    # Determine the first chunk index.
+    first_chunk: int = start // chunk_size
+
+    # Compute the last index in the slice and its chunk.
+    last_index: int = start + (n - 1) * step
+    last_chunk: int = last_index // chunk_size
+
+    chunk_indices: Set[int] = set()
+
+    # Iterate over candidate chunk indices from first_chunk to last_chunk.
+    for j in range(first_chunk, last_chunk + 1):
+        if j == first_chunk:
+            # The first chunk is always touched since a is in it.
+            chunk_indices.add(j)
+        else:
+            # For chunk j, we need the first slice element that reaches or exceeds j*d.
+            # We compute the smallest k (position in the slice) such that:
+            #    a + k*c >= j*d
+            # Using ceiling division with integer arithmetic:
+            k: int = ((j * chunk_size - start) + step - 1) // step
+            # Ensure that k is within the slice and that the element belongs to chunk j.
+            if k < n and (start + k * step) // chunk_size == j:
+                chunk_indices.add(j)
+
+    return chunk_indices
+
+
+def needed_chunks(
+    contract: ValidContract,
+    chunk_shape: Tuple[int, ...],
+) -> List[Tuple[int, ...]]:
+    """
+    Determine the multi-dimensional chunk coordinates needed to cover all indices
+    specified by a tuple of slices. The array has shape 'array_shape' and is partitioned
+    into chunks of shape 'chunk_shape'. Each slice in 'slices' selects indices along
+    its respective dimension.
+
+    Parameters:
+      slices: A tuple of slice objects (one per dimension).
+      array_shape: The overall shape of the array.
+      chunk_shape: The shape (i.e. chunk sizes) along each dimension.
+
+    Returns:
+      A list of tuples where each tuple represents the coordinate of a chunk that
+      contains at least one element from the specified slices.
+    """
+    chunks_per_dim: List[Set[int]] = []
+    # Process each dimension individually.
+    for dim, s in enumerate(contract):
+        chunk_set: Set[int] = efficient_chunks_for_dimension(
+            s.start, s.stop, s.step, chunk_shape[dim]
+        )
+        # Sorting for consistent ordering.
+        chunks_per_dim.append(chunk_set)
+
+    # The overall needed chunks are the Cartesian product of chunk indices from each dimension.
+    return list(itertools.product(*chunks_per_dim))
 
 
 class Deisa:
@@ -381,7 +373,7 @@ class Deisa:
 
     def __init__(
         self,
-        nb_workers: int,
+        nb_expected_dask_workers: int,
         scheduler_file_name: str | None = None,
         scheduler_address: str | None = None,
         cluster=None,
@@ -396,61 +388,58 @@ class Deisa:
         ----------
             - nb_workers: number of workers the Adaptor expects will connect.
 
-            - scheduler_file_name: the name of the scheduler config file in json format.
+            - scheduler_file_name: the name of the scheduler config file in json format. Useful
+            when the scheduler is started from the CLI with the --scheduler-file flag.
+
+            - scheduler_address: the address of the scheduler. Useful when the scheduler is started
+            from the CLI with the --scheduler-address flag.
+
+            - cluster: a Dask cluster instance. Useful when you start a cluster from the python
+            script.
 
             - use_ucx: whether to use ucx.
         """
         if use_ucx:
             os.environ["DASK_DISTRIBUTED__COMM__UCX__INFINIBAND"] = "True"
 
-        # TODO make nicer -- detect types
         if cluster:
-            self.client = Client(cluster)
+            self._client = Client(cluster)
         elif scheduler_address:
-            self.client = create_client_connected_to_scheduler_at(scheduler_address)
+            self._client = create_client_connected_to_scheduler_at(scheduler_address)
         elif scheduler_file_name:
             with open(scheduler_file_name, "r") as f:
-                scheduler_config: dict = json.load(f)
-            self.client: Client = create_client_connected_to_scheduler_at(
+                scheduler_config: Dict = json.load(f)
+            self._client: Client = create_client_connected_to_scheduler_at(
                 scheduler_config["address"]
             )
         else:
             raise RuntimeError(
-                "Must initialize Deisa with cluster object, scheudler encoding,"
+                "Must initialize Deisa with cluster object, scheduler file,"
                 "or scheduler address."
             )
 
-        # Check version info for the client, scheduler, and all the workers.
-        # Raise error if there are any versions mismatch
-        self.client.get_versions(check=True)
-
         # Get list of id of workers connected to scheduler.
-        workers: list[Worker] = list(self.client.scheduler_info()[WORKERS_NAME].keys())
+        self.connected_dask_workers: List[str] = list(
+            self._client.scheduler_info()[WORKERS_NAME].keys()
+        )
 
         # Ensure that all workers (expected) are connected to scheduler
-        while len(workers) != nb_workers:
-            workers = list(self.client.scheduler_info()[WORKERS_NAME].keys())
+        while len(self.connected_dask_workers) != nb_expected_dask_workers:
+            self.connected_dask_workers = list(
+                self._client.scheduler_info()[WORKERS_NAME].keys()
+            )
 
-    def get_client(self) -> Client:
-        """
-        Return the client associated with the Adaptor.
-        """
-        return self.client
+        # blocking call from rank0
+        self.mpi_size: int = Variable(NB_BRIDGES_NAME).get()  # type: ignore
 
-    def get_deisa_arrays(self) -> DeisaArrays:
-        """
-        Return DeisaArrays from the data that PDI shares.
+        self.mapping_rank_to_workers = mapping_mpi_procs_to_dask_workers(
+            self.mpi_size, self.connected_dask_workers
+        )
 
-        DeisaArrays is an object that handles a list of DeisaArray objects which are essentially
-        dask arrays with additional features to track which data is needed and which is not.
-
-        Output
-        ----------
-            - A DeisaArrays object.
-        """
-
-        # shared data will look something like this:
-        # shared_data = {
+        # get metadata of arrays being shared (blocking call from rank0)
+        self.arrays_metadata: Dict[str, Dict] = Queue(ARRAYS_METADATA, client=self._client).get()  # type: ignore
+        # arrays_metadata will look something like this:
+        # arrays_metadata = {
         #     'global_t': {
         #         'timedim': 0,
         #         'subsizes': [1, 10, 20],
@@ -466,17 +455,80 @@ class Deisa:
         #         'dtype': "double"
         #     }
         # }
-        shared_data: dict[str, dict] = Queue(ARRAYS_NAME, client=self.client).get()  # type: ignore
-        assert isinstance(shared_data, dict)
+
+        # create contract -- By default, at initialization, the contract is invalid
+        self.arrays_contract: Dict[str, Contract] = create_null_contract_for_all_arrays(
+            self.arrays_metadata
+        )
+
+        # initialization of mapping of task ID to Queue name for each array
+        self.map_taskID_qname: Dict[str, Dict[tuple, tuple]] = defaultdict(dict)
+
+        # update the mapping
+        self.create_map_taskID_qname()
+
+        # block simulation
+        self.block()
+
+    @property
+    def client(self) -> Client:
+        """
+        Return the client associated with the Adaptor.
+        """
+        return self._client
+
+    def upate_metadata(
+        self,
+    ):
+        """Function that can be called from PDI to update the metadata."""
+        logging.info("Updating metadata!")
+        pass
+
+    def report_event(self, event):
+        """
+        Function to report the ocurrence of an interesting event.
+        """
+        logging.info(f"Event {event} has ocurred!")
+        pass
+
+    def create_map_taskID_qname(self):
+        """
+        Each MPI rank shares a Queue that contains a dictionary that maps array names to a tuple
+        of (TaskID, RankNum). For two ranks:
+            rankX = {
+                "arrayname1" : (taskID-Arr1-X, RankNumX)
+                "arrayname2" : (taskID-Arr2-X, RankNumX)
+            }
+            rankY = {
+                "arrayname1" : (taskID-Arr1-Y, RankNumY)
+                "arrayname2" : (taskID-Arr2-Y, RankNumY)
+            }
+        We want to create a single dictionary that all the information for each array and gets the
+        qname for each array based on the rank. I.e:
+        {
+            "arrayname1": {
+                taskID-Arr1-X: qname-rankNumX
+                taskID-Arr1-Y: qname-rankNumY
+                ...
+            },
+            "arrayname2": {
+                taskID-Arr2-X: qname-rankNumX
+                taskID-Arr2-Y: qname-rankNumY
+                ...
+            }
+        }
+
+        This corresponds to a dictionary inversion of some sort.
+        """
 
         # create task_id dictionary from all the Queues being shared.
         # Each bridge shares a dict like:
         # {
-        #     "name": ((Y,Z), "name-rankX") --- "(Y,Z)" and "X" varies per bridge
-        #     "othername": ((Y,Z), "name-rankX") --- "(Y,Z)" and "X" varies per bridgeX"
+        #     "name":      ((Y,Z), X) --- "(Y,Z)" and "X" varies per bridge
+        #     "othername": ((Y,Z), X) --- "(Y,Z)" and "X" varies per bridgeX"
         # }
 
-        # We need to convert this to a single dictionry of this form:
+        # We need to convert this to a single dictionry of this form (taskid : Queue_name):
         # {
         #     "name": {
         #         (Y1,Z1): "name-rankX",
@@ -491,102 +543,182 @@ class Deisa:
         #     ...
         # }
 
-        size = Variable(NB_BRIDGES_NAME).get()
-        self.task_id = defaultdict(dict)
-        for i in range(size):  # type: ignore
-            # for each MPI rank, get the dict of task + queue name per array being shared
-            q: dict = Queue("task_id" + str(i)).get()  # type: ignore
+        for i in range(self.mpi_size):  # type: ignore
+            # for each MPI rank, get the dict of task + rank name per array being shared
+            # blocking call
+            d: Dict = Queue("task_id" + str(i)).get()  # type: ignore
             # for each array in dict, unpack and put it in the task_id dict
-            for name, val in q.items():
+            for name, val in d.items():
                 # val[0] is the task id -- (Y,Z)
-                # val[1] is the queue name -- "name-rankX"
-                self.task_id[name][val[0]] = val[1]
+                # val[1] is the rank number -- X
+                self.map_taskID_qname[name][val[0]] = (qname_from(name, val[1]), val[1])
 
-        arrays: dict[str, Array] = dict()
-        for shared_array_name in shared_data.keys():
-            # Manually create a dask array
-            arrays[shared_array_name] = self.create_array(
-                name=shared_array_name,
-                shape=shared_data[shared_array_name][SIZE_NAME],
-                chunksize=shared_data[shared_array_name][SUBSIZE_NAME],
-                dtype=shared_data[shared_array_name][DTYPE_NAME],
-                task_to_rank=self.task_id[shared_array_name],
-            )
-
-        return DeisaArrays(arrays)
-
-    def create_array(self, name, shape, chunksize, dtype, task_to_rank):
+    def _create_array(
+        self,
+        name: str,
+        shape: List[int],
+        chunkshape: List[int],
+        dtype: str,
+        task_to_rank: Dict,
+        rank_to_workers: Dict,
+        contract: ValidContract,
+    ):
         """
         Manually create a Dask Array from futures that represent the computations that will
         produced by each MPI process.
-        The idea is that each MPI process will share part of the grid. Each of these computations
+        Each MPI process will share part of the grid. Each of these computations
         are external futures which are chunks of the global array. We want to rebuild the global
         array from the collection of chunks so we can operate on it.
 
         Parameters
         ----------
-            - name: The name of the array being shared by PDI.
-            - shape: The global shape of the array including the dimension over which PDI is
-            iterating.
-            - chunksize: The desired chunksize. This corresponds to the dimension of data produced
-            by each MPI process.
-            - dtype: the data type of the array
-            - task_to_rank: a dictionary where we associate a task ID to a queue name to get
-            futures from
+            - name: The name of the array.
+            - shape: The shape of the entire array including the time dimension.
+            - chunksize: The shape of each chunk. This corresponds to the shape of a subgrid
+            produced by an MPI process.
+            - dtype: the data type of the array.
+            - task_to_rank: a mapping of taskID to a queue name to get futures from.
+            - rank_to_workers: a mapping of MPI rank to Dask Workers.
+            - contract: a ValidContract that specifies what index per dimension the user wants for
+            the array.
 
         Output
         ----------
             - A Dask array of the global data.
         """
-        # TODO dask supports the creation of "sparse" arrays where only certain chunks are defined.
-        # this is ok bc as long as all upstream tasks depend only on the chunks that are present.
-        # A possible solution to the contract problem is to create *ONLY* the chunks requested by
-        # the user!
 
-        @dask.delayed
-        def deisa_ext_task(pull_from, depends_on=None):
+        @dask.delayed  # type: ignore
+        def deisa_ext_task(task_id, pull_from, depends_on=None):
             # get a temporary client in the worker
             with worker_client():
                 # get future of scatter operation from specific Queue
                 f = Queue(pull_from).get()
-            # return the result of the future
-            # TODO return future directly? Investigate if Dask supports this in general.
+                # print(f"Executing {task_id} on worker {get_worker().name}")
             return f.result()  # type: ignore
 
-        chunks_in_each_dim = [shape[i] // chunksize[i] for i in range(len(shape))]
+        chunks_in_each_dim = [shape[i] // chunkshape[i] for i in range(len(shape))]
         chunks = tuple(
-            [(chunksize[i],) * chunks_in_each_dim[i] for i in range(len(shape))]
+            [(chunkshape[i],) * chunks_in_each_dim[i] for i in range(len(shape))]
         )
-        chunk_coords = list(itertools.product(*[range(i) for i in chunks_in_each_dim]))
+        needed_chunk_coords = needed_chunks(
+            contract=contract, chunk_shape=tuple(chunkshape)
+        )
+
+        # TODO make sure its sorted. For now we assume it is because of how
+        # itertools.product works. But in the future, it would be nice to make sure.
 
         # chunk coords identify the task (except for the time dim)
         custom_gt = {}
         deps = []
-        for coord in chunk_coords:
+        first_needed_time = needed_chunk_coords[0][0]
+        last_task_id = {}
+        for coord in needed_chunk_coords:
             # remove time dimension
             task_id = coord[1:]
-            queue_name = task_to_rank[task_id]
-            if coord[0] == 0:
-                # if timestep is 0 (first time step) we simply create the external task.
-                value = deisa_ext_task(pull_from=queue_name)
-                # add dependency
-                deps.append(value)
-            else:
-                # in all other cases, we create a fake time dependency by passing the previous task
-                # as an argument. This makes sure that tasks get scheduled in the correct order.
+            queue_name = task_to_rank[task_id][0]
+            dask_worker = rank_to_workers[task_to_rank[task_id][1]]
+            if coord[0] == first_needed_time:
+                # for first needed time, just create the ext task.
+                with dask.annotate(workers=dask_worker, allow_other_workers=False):  # type: ignore
+                    value = deisa_ext_task(task_id=task_id, pull_from=queue_name)
 
-                # TODO does it make a diff to depend on the ext task or the key of the task?
-                # maybe this eliminates the problem of dask removing the time deps
-                value = deisa_ext_task(
-                    pull_from=queue_name,
-                    depends_on=custom_gt[(name, coord[0] - 1, *coord[1:])],
-                )
+                # add the dependency
                 deps.append(value)
+                last_task_id[task_id] = value
+            else:
+                # in all other cases, we create a fake time dependency by passing the previous tasks
+                # as an argument. This makes sure that tasks get scheduled in the correct order.
+                with dask.annotate(workers=dask_worker, allow_other_workers=False):  # type: ignore
+                    value = deisa_ext_task(
+                        task_id=task_id,
+                        pull_from=queue_name,
+                        depends_on=last_task_id[task_id],
+                    )
+                deps.append(value)
+                last_task_id[task_id] = value
 
             custom_gt[(name, *coord)] = value.key
         dsk = HighLevelGraph.from_collections(name, custom_gt, dependencies=deps)
-        custom_gt = da.Array(dsk, name, chunks, dtype)
+        custom_gt = da.Array(dsk, name, chunks, dtype)  # type: ignore
         return custom_gt
+
+    def __getitem__(self, keys: tuple) -> Array:
+        """
+        Entry point for Deisa adaptor. Builds the array with a given name and a given slice.
+        """
+        # extract name of array
+        assert isinstance(
+            keys[0], str
+        ), f"Expected str (for array name) as first argument of __getitem__(). Got {type(keys[0])}"
+
+        name = keys[0]
+
+        try:
+            # try to fetch metadata for array
+            metadata = self.arrays_metadata[name]
+        except KeyError:
+            # if array name does not exist in metadata, raise KeyError - This is the control aspect
+            # of the contract paper.
+            raise KeyError(
+                f"Array {name} is not shared by the simulation. Check that"
+                "simulation.yml is properly configured to share the array."
+            )
+        else:
+            assert len(keys[1:]) == len(
+                self.arrays_metadata[name][SIZE_NAME]
+            ), f"""
+            Expected a slice in all dimensions of array {name}. Received {len(keys[1:])}. Please 
+            specify slice in all dimensions, for example: [:,:,:] for a 3D array.
+            """
+            logging.info("Creating contract...")
+            contract: ValidContract = create_valid_contract(
+                name, tuple(keys[1:]), metadata
+            )
+
+            if type(self.arrays_contract[name]) is ValidContract:
+                logging.info("User requested new contract... Updating.")
+            else:
+                logging.info("Creating new contract for user!")
+
+            # update the contract for the array internally
+            self.arrays_contract[name] = contract
+
+            # At this point, the metadata is set, the contract is set.
+            # We can create the (sparse) array!
+            return self._create_array(
+                name=name,
+                # I need to know shape of the array
+                shape=metadata[SIZE_NAME],
+                # I need to know the shape of subgrids shared by each MPI rank
+                chunkshape=metadata[SUBSIZE_NAME],
+                # I need to know the dtype of the array
+                dtype=metadata[DTYPE_NAME],
+                # I need the mapping of task_id to Queue name
+                task_to_rank=self.map_taskID_qname[name],
+                # I need the mapping of rank_to_workers
+                rank_to_workers=self.mapping_rank_to_workers,
+                # I need the contract for this specific array
+                contract=contract,
+            ).__getitem__(keys[1:])
+
+    def share_contract(self):
+        """
+        Share the contract with Bridges. Called everytime __getitem__ is called so that
+        Bridges update the contract.
+        """
+        Variable("contract").set(self.arrays_contract)
+        logging.info("contract shared with bridges.")
+
+    def block(
+        self,
+    ):
+        Variable("block").set(True)
+
+    def ready(
+        self,
+    ):
+        self.share_contract()
+        Variable("block").set(False)
 
     def wait_for_last_bridge_and_shutdown(self, delay=2):
         """
@@ -597,14 +729,16 @@ class Deisa:
         ----------
             - delay: how much time to wait before checking again if bridges are all shutdown.
         """
-        assert self.client is not None
+        assert self._client is not None
         nb_bridges_still_active = Variable(NB_BRIDGES_NAME).get()
         if nb_bridges_still_active == 0:
             # shutdown last client and whole cluster
-            self.client.shutdown()
+            self._client.shutdown()
         else:
             time.sleep(delay)
             self.wait_for_last_bridge_and_shutdown(delay=delay)
+
+        # TODO data cleanup
 
 
 class BridgeV1:
@@ -620,9 +754,9 @@ class BridgeV1:
         self,
         mpi_rank: int,
         mpi_size: int,
-        arrays_description: dict[str, dict],
-        arrays_description_dtype: dict,
-        scheduler_encoding: list[int] | None = None,
+        arrays_metadata: Dict[str, Dict],
+        arrays_metadata_dtype: Dict,
+        scheduler_encoding: List[int] | None = None,
         cluster=None,
         scheduler_address: str | None = None,
         use_ucx: bool = False,
@@ -670,7 +804,7 @@ class BridgeV1:
         if scheduler_encoding is not None:
             scheduler_file_name: str = "".join(chr(i) for i in scheduler_encoding)
             with open(scheduler_file_name[:-1], "r") as f:
-                scheduler_config: dict = json.load(f)
+                scheduler_config: Dict = json.load(f)
             address: str = scheduler_config["address"]
             self.client: Client = create_client_connected_to_scheduler_at(address)
         elif cluster is not None:
@@ -690,22 +824,24 @@ class BridgeV1:
         assert self.client is not None, "Client was not able to connect!"
 
         # get workers per bridge using round robin scheme
-        self.workers: list[str] = self.get_workers()
+        mapping_mpi_to_dask: Dict[int, list] = mapping_mpi_procs_to_dask_workers(
+            self.mpi_size, list(self.client.scheduler_info()[WORKERS_NAME].keys())
+        )
+        self.dask_workers: List[str] = mapping_mpi_to_dask[self.mpi_rank]
 
-        self.shared_data: dict[str, dict] = arrays_description
-        self.shared_data_dtype: dict = arrays_description_dtype
+        self.arrays_metadata: Dict[str, Dict] = arrays_metadata
 
-        for array_name in self.shared_data.keys():
+        for array_name in self.arrays_metadata.keys():
 
             # merge dtype info into description dict
-            self.shared_data[array_name][DTYPE_NAME] = str(
-                self.shared_data_dtype[array_name]
+            self.arrays_metadata[array_name][DTYPE_NAME] = str(
+                arrays_metadata_dtype[array_name]
             )
 
             # unpack time dimension from [num] -> num
-            self.shared_data[array_name][TIME_DIMENSION_NAME] = self.shared_data[
-                array_name
-            ][TIME_DIMENSION_NAME][0]
+            self.arrays_metadata[array_name][TIME_DIMENSION_NAME] = (
+                self.arrays_metadata[array_name][TIME_DIMENSION_NAME][0]
+            )
 
         if self.mpi_rank == 0:
             # share MPI size among all clients. I am sure that all of them are connected since
@@ -715,36 +851,39 @@ class BridgeV1:
             )
             # Share the description. Since we only need info for size and subsize, only rank0
             # needs to share.
-            Queue(ARRAYS_NAME).put(self.shared_data)
-
-        # Contract of each bridge.
-        self.contract = None
+            Queue(ARRAYS_METADATA).put(self.arrays_metadata)
 
         # Each bridge has its own:
         # 1. Queue per array being shared - for each array, the queue will contain the
         # futures of scatter operation.
         # 2. Task_id per array i.e. task (0,0) is always associated to rank0 for example.
         # Hypothetically, this can be different for each array.
-        self.queues = {}
-        self.task_id = {}
-        for name, v in self.shared_data.items():
+        self.queues: Dict[str, Queue] = {}
+        task_id: Dict[str, tuple[tuple, int]] = {}
+        self.current_chunk_per_array: Dict[str, list] = {}
+        for name, v in self.arrays_metadata.items():
             # position of bridge in global array: for example if bridge starts at position 6 in
             # dim1, and the subsize in dim1 is 2, then it will be the (6/2) 3rd bridge in that dim.
             new_k = [
                 v["starts"][i] // v["subsizes"][i] for i in range(len(v["starts"]))
             ]
+            # add chunk coord info for that array
+            self.current_chunk_per_array[name] = list(new_k)
+
             # the id is time invariant. Each bridge will deal with same portion of array through
             # time. So we pop the time dimension. This is the task_id.
             new_k.pop(v[TIME_DIMENSION_NAME])
 
-            # the name of the queue per bridge, per array being shared.
-            qname = str(name) + "-rank" + str(self.mpi_rank)
-
             # for each array name, store the position of the array (invariant in time) and the name
             # of the queue.
-            self.task_id[name] = (tuple(new_k), qname)
+            task_id[name] = (tuple(new_k), self.mpi_rank)
 
-            # create the actual Queue with the name
+            # the name of the queue per bridge, per array being shared.
+            # The name must be unique across ranks otherwise all ranks will put in the same queue.
+            # (the queue is globally shared and is identified by its name)
+            qname = qname_from(name, self.mpi_rank)
+
+            # create the actual Queue with name qname
             self.queues[name] = Queue(qname)
 
         # queues will be something like this (for bridge belonging to rankX):
@@ -754,46 +893,42 @@ class BridgeV1:
         #   ....
         # }
 
-        # task_id will be something like this:
+        # task_id will be something like this (for bridge belonging to rankX):
         # {
-        #   "global_t": ( (Y,Z), "global_t-rankX" )
-        #   "global_p": ( (Y,Z), "global_p-rankX" )
+        #   "global_t": ( (Y,Z), X )
+        #   "global_p": ( (Y,Z), X )
         #   ....
         # }
 
         # Share task_id so that main client can build arrays properly.
-        Queue("task_id" + str(self.mpi_rank)).put(self.task_id)
+        Queue("task_id" + str(self.mpi_rank)).put(task_id)
 
-    def get_workers(self) -> list[str]:
-        """
-        Get the Dask workers that will receive data from the Bridge. The worker(s) are chosen based
-        on the rank of the Bridge.
+        # wait until analytics are ready.
+        while Variable("block").get():
+            time.sleep(1)
 
-        Output
-        ----------
-            - List of workers corresponding to the Bridge.
-        """
-        total_dask_workers = list(self.client.scheduler_info()[WORKERS_NAME].keys())
+        self.arrays_contract: Dict[str, Contract] = {}
+        d_c: Dict[str, ValidContract] = Variable("contract").get()  # type: ignore
+        for name, contract in d_c.items():
+            if contract is None:
+                self.arrays_contract[name] = NullContract(None)
+            else:
+                self.arrays_contract[name] = ValidContract(
+                    list(map(MySlice._make, contract))
+                )
 
-        if self.mpi_size >= len(total_dask_workers):
-            # more MPI processes than dask_workers - each MPI process sends only to one dask_worker
-            # ex: MPI size 10 and total_dask_workers  5
-            # rank 0 and rank 5 will send to worker 0
-            # rank 1 and rank 6 will send to worker 1
-            # etc.
-            # This is a round robin scheme
-            return [total_dask_workers[self.mpi_rank % len(total_dask_workers)]]
-        else:
-            raise RuntimeError(
-                "There are more Dask workers than MPI processes. There must be less"
-                "(or the equal) Dask workers than MPI processes. "
-            )
+        # based on contract, we know what are the needed chunks for each array
+        self.simulation_needed_chunks = {}
+        for name, contract in self.arrays_contract.items():
+            if type(contract) is NullContract:
+                self.simulation_needed_chunks[name] = None
+            else:
+                self.simulation_needed_chunks[name] = needed_chunks(
+                    contract=contract,
+                    chunk_shape=self.arrays_metadata[name][SUBSIZE_NAME],
+                )
 
-    # TODO For now, contracts are not being used since it would deadlock the whole system.
-    # introduce them later.
-    def publish_data(
-        self, shared_array: NDArray, shared_array_name: str, timestep: int, debug=False
-    ):
+    def publish_data(self, array: NDArray, array_name: str, timestep: int, debug=False):
         """
         This method is called from PDI's deisa plugin. It is responsible for recalculating
         the position of each Bridge within the global arrays and for calling the scatter method.
@@ -805,22 +940,69 @@ class BridgeV1:
             - timestep: the current timestep.
             - debug: weather debug mode is activated.
         """
+        # TODO
+        # publish_data has missing behavior:
+        # 1. when analytics calls block to simulation it should wait (user might be requesting new
+        # analytics)
+        # 2. when interesting event happens, simulation will roll back to a previous state and new
+        # analytics will be triggered. In this case publish data should just return for the current
+        # timestep.
+        # WE MIGHT NEED TO CLEAN UP ANY LINGERING FUTURES
+        # while Variable("block").get():
+        #     time.sleep(1)
+        # if important_event():
+        #     return False
 
-        # insert a dimension at timedim position.
-        # so for example an array of shape (2,5) becomes of shape (1,2,5) if the timedim is 0
-        # needed by dask since we build the entire array
-        shared_array = np.expand_dims(
-            shared_array, self.shared_data[shared_array_name][TIME_DIMENSION_NAME]
-        )
+        # update the current chunk
+        self.current_chunk_per_array[array_name][0] = timestep
 
-        # scatter data to assigned dask worker
-        f = self.client.scatter(shared_array, direct=True, workers=self.workers)
+        # check if data is needed
+        data_is_needed: bool = self.check_data_is_needed(array_name, timestep)
 
-        # put the future in the corresponding queue
-        self.queues[shared_array_name].put(f)
+        if data_is_needed:
+
+            # insert a dimension at timedim position.
+            # so for example an array of shape (2,5) becomes of shape (1,2,5) if the timedim is 0
+            # needed by dask since we build the entire array
+            array = np.expand_dims(
+                array,
+                self.arrays_metadata[array_name][TIME_DIMENSION_NAME],
+            )
+
+            # scatter data to assigned dask worker
+            f = self.client.scatter(array, direct=True, workers=self.dask_workers)
+
+            # put the future in the corresponding queue
+            self.queues[array_name].put(f)
+        else:
+            logging.info("Data not needed by analytics.")
+            pass
+
+    def check_data_is_needed(
+        self,
+        array_name,
+        timestep,
+    ):
+
+        if self.simulation_needed_chunks[array_name] is None:
+            return False
+        elif (
+            tuple(self.current_chunk_per_array[array_name])
+            in self.simulation_needed_chunks[array_name]
+        ):
+            logging.info(
+                f"Sharing {array_name} at t={timestep} from rank {self.mpi_rank}."
+            )
+            return True
+        else:
+            logging.info(
+                f"""
+                Trying to share {array_name} at t={timestep} from rank {self.mpi_rank} but user 
+                does not need it. Share avoided."""
+            )
+            return False
 
     def release(self):
-        # print(f"Release called from rank {self.mpi_rank}", flush=True)
         with Lock(BRIDGE_LOCK_NAME, client=self.client):
             # shut down client gracefully
             # get number of bridges to reduce by one
@@ -828,8 +1010,7 @@ class BridgeV1:
             nb_bridges = var_nb_bridges.get(timeout="500ms")
 
             # reduce number of bridges by one since this client shut down
-            var_nb_bridges.set(nb_bridges - 1)
-            # print("nb bridges=" + str(var_nb_bridges.get()))
+            var_nb_bridges.set(nb_bridges - 1)  # type: ignore
 
         # this call has to be outside of with context manager otherwise I get IO loop closed error.
         # basically the client has to inform the scheduler that lock is free, but if I close the
