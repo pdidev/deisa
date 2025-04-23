@@ -58,8 +58,10 @@ NullContract = NewType("NullContract", None)
 # A contract is either a ValidContract or a NullContract
 Contract = Union[ValidContract, NullContract]
 
+# A reference to the actual implementation
+_mapping_implementation = None
 
-def mapping_mpi_procs_to_dask_workers(mpi_size: int, dask_workers: list[str]):
+def default_mapping_implementation(mpi_size: int, dask_workers: list[str]):
     """
     Determine mapping of MPI ranks to corresponding Dask workers. This function can be overriden
     by the user to whatever mapping they desire.
@@ -80,6 +82,26 @@ def mapping_mpi_procs_to_dask_workers(mpi_size: int, dask_workers: list[str]):
         mapping[rank] = [dask_workers[rank % len(dask_workers)]]
 
     return mapping
+
+def set_mapping_implementation(func):
+    """Set a custom mapping implementation"""
+    global _mapping_implementation
+    _mapping_implementation = func
+
+def mapping_mpi_procs_to_dask_workers(mpi_size: int, dask_workers: list[str]):
+    """
+    Determine mapping of MPI ranks to corresponding Dask workers. This function can be overriden
+    by the user to whatever mapping they desire.
+
+    Output
+    ----------
+        - Dictionary of MPI rank number to list of IP addresses of Dask Workers.
+    """
+    # If no custom implementation is set, use the default
+    if _mapping_implementation is None:
+        return default_mapping_implementation(mpi_size, dask_workers)
+    else:
+        return _mapping_implementation(mpi_size, dask_workers)
 
 
 def create_client_connected_to_scheduler_at(
